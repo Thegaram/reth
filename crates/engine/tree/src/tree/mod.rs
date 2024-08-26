@@ -28,7 +28,7 @@ use reth_primitives::{
 };
 use reth_provider::{
     BlockReader, ExecutionOutcome, ProviderError, StateProviderBox, StateProviderFactory,
-    StateRootProvider,
+    StateReader, StateRootProvider, TransactionVariant,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_rpc_types::{
@@ -39,7 +39,7 @@ use reth_rpc_types::{
     ExecutionPayload,
 };
 use reth_stages_api::ControlFlow;
-use reth_trie::HashedPostState;
+use reth_trie::{updates::TrieUpdates, HashedPostState};
 use std::{
     collections::{btree_map, hash_map, BTreeMap, HashMap, HashSet, VecDeque},
     ops::Bound,
@@ -81,6 +81,10 @@ pub struct TreeState {
     blocks_by_number: BTreeMap<BlockNumber, Vec<ExecutedBlock>>,
     /// Map of any parent block hash to its children.
     parent_to_child: HashMap<B256, HashSet<B256>>,
+    /// Map of hash to trie updates for canonical blocks that are persisted but not finalized.
+    ///
+    /// Contains the block number for easy removal.
+    persisted_trie_updates: HashMap<B256, (BlockNumber, Arc<TrieUpdates>)>,
     /// Currently tracked canonical head of the chain.
     current_canonical_head: BlockNumHash,
 }
@@ -93,12 +97,18 @@ impl TreeState {
             blocks_by_number: BTreeMap::new(),
             current_canonical_head,
             parent_to_child: HashMap::new(),
+            persisted_trie_updates: HashMap::new(),
         }
     }
 
     /// Returns the number of executed blocks stored.
     fn block_count(&self) -> usize {
         self.blocks_by_hash.len()
+    }
+
+    /// Returns the [`ExecutedBlock`] by hash.
+    fn executed_block_by_hash(&self, hash: B256) -> Option<&ExecutedBlock> {
+        self.blocks_by_hash.get(&hash)
     }
 
     /// Returns the block by hash.
@@ -236,14 +246,17 @@ impl TreeState {
         // * fetch the number of the finalized hash, removing any sidechains that are __below__ the
         // finalized block
 
-        // TODO: move trie updates here
         // First, let's walk back the canonical chain and remove canonical blocks lower than the
         // upper bound
         let mut current_block = self.current_canonical_head.hash;
         while let Some(executed) = self.blocks_by_hash.get(&current_block) {
             current_block = executed.block.parent_hash;
             if executed.block.number <= upper_bound {
-                self.remove_by_hash(executed.block.hash());
+                if let Some((removed, _)) = self.remove_by_hash(executed.block.hash()) {
+                    // finally, move the trie updates
+                    self.persisted_trie_updates
+                        .insert(removed.block.hash(), (removed.block.number, removed.trie));
+                }
             }
         }
 
@@ -258,7 +271,6 @@ impl TreeState {
 
             // We _exclude_ the finalized block because we will be dealing with the blocks __at__
             // the finalized block later.
-            // TODO: remove trie updates whose root are below the finalized block
             let blocks_to_remove = self
                 .blocks_by_number
                 .range((Bound::Unbounded, Bound::Excluded(finalized)))
@@ -267,6 +279,9 @@ impl TreeState {
             for hash in blocks_to_remove {
                 self.remove_by_hash(hash);
             }
+
+            // remove trie updates that are below the finalized block
+            self.persisted_trie_updates.retain(|_, (block_num, _)| *block_num <= finalized);
 
             // The only blocks that exist at `finalized_num` now, are blocks in sidechains that
             // should be removed.
@@ -500,7 +515,7 @@ pub struct EngineApiTreeHandler<P, E, T: EngineTypes> {
 
 impl<P, E, T> EngineApiTreeHandler<P, E, T>
 where
-    P: BlockReader + StateProviderFactory + Clone + 'static,
+    P: BlockReader + StateProviderFactory + StateReader + Clone + 'static,
     E: BlockExecutorProvider,
     T: EngineTypes,
 {
@@ -1280,6 +1295,47 @@ where
             .remove_persisted_blocks(self.persistence_state.last_persisted_block_number);
     }
 
+    /// Return an [`ExecutedBlock`] from database or in-memory state by hash.
+    ///
+    /// NOTE: This cannot fetch [`ExecutedBlock`]s for _finalized_ blocks, instead it can only
+    /// fetch [`ExecutedBlock`]s for _canonical_ blocks, or blocks from sidechains that the node
+    /// has in memory.
+    ///
+    /// For finalized blocks, this will return `None`.
+    #[allow(unused)]
+    fn executed_block_by_hash(&self, hash: B256) -> ProviderResult<Option<ExecutedBlock>> {
+        // check memory first
+        let block = self
+            .state
+            .tree_state
+            .executed_block_by_hash(hash)
+            // TODO: clone for compatibility. should we return an Arc here?
+            .cloned();
+
+        if block.is_some() {
+            Ok(block)
+        } else if let Some((_, updates)) = self.state.tree_state.persisted_trie_updates.get(&hash) {
+            let SealedBlockWithSenders { block, senders } = self
+                .provider
+                .sealed_block_with_senders(hash.into(), TransactionVariant::WithHash)?
+                .expect("todo: some sort of error or return None if num not found");
+            let execution_output = self.provider.get_state(block.number)?.expect("again todo err");
+            let hashed_state = execution_output.hash_state_slow();
+
+            // todo: construct hashed state
+            Ok(Some(ExecutedBlock {
+                block: Arc::new(block),
+                senders: Arc::new(senders),
+                // TODO: should we `remove` to take ownership and remove the clone?
+                trie: updates.clone(),
+                execution_output: Arc::new(execution_output),
+                hashed_state: Arc::new(hashed_state),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Return sealed block from database or in-memory state by hash.
     fn sealed_header_by_hash(&self, hash: B256) -> ProviderResult<Option<SealedHeader>> {
         // check memory first
@@ -1648,7 +1704,7 @@ where
     ///
     /// This is invoked on a valid forkchoice update, or if we can make the target block canonical.
     fn on_canonical_chain_update(&mut self, chain_update: NewCanonicalChain) {
-        trace!(target: "engine", new_blocks = %chain_update.new_block_count(), reorged_blocks =  %chain_update.reorged_block_count() ,"applying new chain update");
+        trace!(target: "engine", new_blocks = %chain_update.new_block_count(), reorged_blocks =  %chain_update.reorged_block_count(), "applying new chain update");
         let start = Instant::now();
 
         // update the tracked canonical head
@@ -2258,6 +2314,7 @@ mod tests {
                 blocks_by_number,
                 current_canonical_head: blocks.last().unwrap().block().num_hash(),
                 parent_to_child,
+                persisted_trie_updates: HashMap::default(),
             };
 
             let last_executed_block = blocks.last().unwrap().clone();

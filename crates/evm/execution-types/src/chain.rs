@@ -196,6 +196,16 @@ impl Chain {
         self.blocks.first_key_value().expect("Chain should have at least one block").1
     }
 
+    /// Consumes the [`Chain`], returning the first entry, and the remaining block map.
+    ///
+    /// The remainder block map may be empty if the [`Chain`] contained only one block.
+    #[track_caller]
+    pub fn split_first(
+        mut self,
+    ) -> (SealedBlockWithSenders, BTreeMap<BlockNumber, SealedBlockWithSenders>) {
+        (self.blocks.pop_first().expect("Chain should have at least one block").1, self.blocks)
+    }
+
     /// Get the tip of the chain.
     ///
     /// # Panics
@@ -411,6 +421,17 @@ impl<'a> ChainBlocks<'a> {
     #[inline]
     pub fn first(&self) -> &SealedBlockWithSenders {
         self.blocks.first_key_value().expect("Chain should have at least one block").1
+    }
+
+    /// Consumes the [`ChainBlocks`], returning the first entry, and the remaining block map.
+    ///
+    /// The remainder block map may be empty if the [`ChainBlocks`] contained only one block.
+    #[track_caller]
+    pub fn split_first(
+        self,
+    ) -> (SealedBlockWithSenders, BTreeMap<BlockNumber, SealedBlockWithSenders>) {
+        let mut blocks = self.blocks.into_owned();
+        (blocks.pop_first().expect("Chain should have at least one block").1, blocks)
     }
 
     /// Returns an iterator over all transactions in the chain.
