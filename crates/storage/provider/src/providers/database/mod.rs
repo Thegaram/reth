@@ -28,7 +28,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::watch;
-use tracing::trace;
+use tracing::{debug, trace};
 
 mod provider;
 pub use provider::{DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW};
@@ -206,6 +206,7 @@ impl<DB: Database> HeaderProvider for ProviderFactory<DB> {
     }
 
     fn header_td_by_number(&self, number: BlockNumber) -> ProviderResult<Option<U256>> {
+        debug!(target: "engine", ?number, "Getting total difficulty for block");
         if let Some(td) = self.chain_spec.final_paris_total_difficulty(number) {
             // if this block is higher than the final paris(merge) block, return the final paris
             // difficulty
@@ -603,6 +604,7 @@ impl<DB, Spec> Clone for ProviderFactory<DB, Spec> {
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -28,7 +28,7 @@ use reth_primitives::{
 };
 use reth_provider::{
     BlockReader, ExecutionOutcome, ProviderError, StateProviderBox, StateProviderFactory,
-    StateRootProvider,
+    StateReader, StateRootProvider, TransactionVariant,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_rpc_types::{
@@ -39,8 +39,9 @@ use reth_rpc_types::{
     ExecutionPayload,
 };
 use reth_stages_api::ControlFlow;
-use reth_trie::HashedPostState;
+use reth_trie::{updates::TrieUpdates, HashedPostState};
 use std::{
+    cmp::Ordering,
     collections::{btree_map, hash_map, BTreeMap, HashMap, HashSet, VecDeque},
     ops::Bound,
     sync::{
@@ -81,6 +82,10 @@ pub struct TreeState {
     blocks_by_number: BTreeMap<BlockNumber, Vec<ExecutedBlock>>,
     /// Map of any parent block hash to its children.
     parent_to_child: HashMap<B256, HashSet<B256>>,
+    /// Map of hash to trie updates for canonical blocks that are persisted but not finalized.
+    ///
+    /// Contains the block number for easy removal.
+    persisted_trie_updates: HashMap<B256, (BlockNumber, Arc<TrieUpdates>)>,
     /// Currently tracked canonical head of the chain.
     current_canonical_head: BlockNumHash,
 }
@@ -93,12 +98,18 @@ impl TreeState {
             blocks_by_number: BTreeMap::new(),
             current_canonical_head,
             parent_to_child: HashMap::new(),
+            persisted_trie_updates: HashMap::new(),
         }
     }
 
     /// Returns the number of executed blocks stored.
     fn block_count(&self) -> usize {
         self.blocks_by_hash.len()
+    }
+
+    /// Returns the [`ExecutedBlock`] by hash.
+    fn executed_block_by_hash(&self, hash: B256) -> Option<&ExecutedBlock> {
+        self.blocks_by_hash.get(&hash)
     }
 
     /// Returns the block by hash.
@@ -147,33 +158,6 @@ impl TreeState {
         for children in self.parent_to_child.values_mut() {
             children.retain(|child| self.blocks_by_hash.contains_key(child));
         }
-    }
-
-    /// Determines if the given block is part of a fork by checking that these
-    /// conditions are true:
-    /// * walking back from the target hash to verify that the target hash is not part of an
-    ///   extension of the canonical chain.
-    /// * walking back from the current head to verify that the target hash is not already part of
-    ///   the canonical chain.
-    fn is_fork(&self, target_hash: B256) -> bool {
-        // verify that the given hash is not part of an extension of the canon chain.
-        let mut current_hash = target_hash;
-        while let Some(current_block) = self.block_by_hash(current_hash) {
-            if current_block.hash() == self.canonical_block_hash() {
-                return false
-            }
-            current_hash = current_block.header.parent_hash;
-        }
-
-        // verify that the given hash is not already part of the canon chain
-        current_hash = self.canonical_block_hash();
-        while let Some(current_block) = self.block_by_hash(current_hash) {
-            if current_block.hash() == target_hash {
-                return false
-            }
-            current_hash = current_block.header.parent_hash;
-        }
-        true
     }
 
     /// Remove single executed block by its hash.
@@ -248,14 +232,19 @@ impl TreeState {
         // * fetch the number of the finalized hash, removing any sidechains that are __below__ the
         // finalized block
 
-        // TODO: move trie updates here
         // First, let's walk back the canonical chain and remove canonical blocks lower than the
         // upper bound
         let mut current_block = self.current_canonical_head.hash;
         while let Some(executed) = self.blocks_by_hash.get(&current_block) {
             current_block = executed.block.parent_hash;
             if executed.block.number <= upper_bound {
-                self.remove_by_hash(executed.block.hash());
+                debug!(target: "engine", num_hash=?executed.block.num_hash(), "Attempting to remove block walking back from the head");
+                if let Some((removed, _)) = self.remove_by_hash(executed.block.hash()) {
+                    debug!(target: "engine", num_hash=?removed.block.num_hash(), "Removed block walking back from the head");
+                    // finally, move the trie updates
+                    self.persisted_trie_updates
+                        .insert(removed.block.hash(), (removed.block.number, removed.trie));
+                }
             }
         }
 
@@ -270,15 +259,19 @@ impl TreeState {
 
             // We _exclude_ the finalized block because we will be dealing with the blocks __at__
             // the finalized block later.
-            // TODO: remove trie updates whose root are below the finalized block
             let blocks_to_remove = self
                 .blocks_by_number
                 .range((Bound::Unbounded, Bound::Excluded(finalized)))
                 .flat_map(|(_, blocks)| blocks.iter().map(|b| b.block.hash()))
                 .collect::<Vec<_>>();
             for hash in blocks_to_remove {
-                self.remove_by_hash(hash);
+                if let Some((removed, _)) = self.remove_by_hash(hash) {
+                    debug!(target: "engine", num_hash=?removed.block.num_hash(), "Removed finalized sidechain block");
+                }
             }
+
+            // remove trie updates that are below the finalized block
+            self.persisted_trie_updates.retain(|_, (block_num, _)| *block_num < finalized);
 
             // The only blocks that exist at `finalized_num` now, are blocks in sidechains that
             // should be removed.
@@ -292,7 +285,8 @@ impl TreeState {
                 .map(|blocks| blocks.into_iter().map(|e| e.block.hash()).collect::<VecDeque<_>>())
                 .unwrap_or_default();
             while let Some(block) = blocks_to_remove.pop_front() {
-                if let Some((_, children)) = self.remove_by_hash(block) {
+                if let Some((removed, children)) = self.remove_by_hash(block) {
+                    debug!(target: "engine", num_hash=?removed.block.num_hash(), "Removed finalized sidechain child block");
                     blocks_to_remove.extend(children);
                 }
             }
@@ -317,75 +311,6 @@ impl TreeState {
     /// Returns the block number of the canonical head.
     const fn canonical_block_number(&self) -> BlockNumber {
         self.canonical_head().number
-    }
-
-    /// Returns the new chain for the given head.
-    ///
-    /// This also handles reorgs.
-    ///
-    /// Note: This does not update the tracked state and instead returns the new chain based on the
-    /// given head.
-    fn on_new_head(&self, new_head: B256) -> Option<NewCanonicalChain> {
-        let new_head_block = self.blocks_by_hash.get(&new_head)?;
-        let new_head_number = new_head_block.block.number;
-        let current_canonical_number = self.current_canonical_head.number;
-
-        let mut new_chain = vec![new_head_block.clone()];
-        let mut current_hash = new_head_block.block.parent_hash;
-        let mut current_number = new_head_number - 1;
-
-        // Walk back the new chain until we reach a block we know about
-        while current_number > current_canonical_number {
-            if let Some(block) = self.blocks_by_hash.get(&current_hash) {
-                new_chain.push(block.clone());
-                current_hash = block.block.parent_hash;
-                current_number -= 1;
-            } else {
-                return None; // We don't have the full chain
-            }
-        }
-
-        if current_hash == self.current_canonical_head.hash {
-            new_chain.reverse();
-
-            // Simple extension of the current chain
-            return Some(NewCanonicalChain::Commit { new: new_chain });
-        }
-
-        // We have a reorg. Walk back both chains to find the fork point.
-        let mut old_chain = Vec::new();
-        let mut old_hash = self.current_canonical_head.hash;
-
-        while old_hash != current_hash {
-            if let Some(block) = self.blocks_by_hash.get(&old_hash) {
-                old_chain.push(block.clone());
-                old_hash = block.block.parent_hash;
-            } else {
-                // This shouldn't happen as we're walking back the canonical chain
-                warn!(target: "consensus::engine", invalid_hash=?old_hash, "Canonical block not found in TreeState");
-                return None;
-            }
-
-            if old_hash == current_hash {
-                // We've found the fork point
-                break;
-            }
-
-            if let Some(block) = self.blocks_by_hash.get(&current_hash) {
-                if self.is_fork(block.block.hash()) {
-                    new_chain.push(block.clone());
-                    current_hash = block.block.parent_hash;
-                }
-            } else {
-                // This shouldn't happen as we've already walked this path
-                warn!(target: "consensus::engine", invalid_hash=?current_hash, "New chain block not found in TreeState");
-                return None;
-            }
-        }
-        new_chain.reverse();
-        old_chain.reverse();
-
-        Some(NewCanonicalChain::Reorg { new: new_chain, old: old_chain })
     }
 }
 
@@ -464,7 +389,12 @@ impl TreeEvent {
 #[derive(Debug)]
 pub enum TreeAction {
     /// Make target canonical.
-    MakeCanonical(B256),
+    MakeCanonical {
+        /// The sync target head hash
+        sync_target_head: B256,
+        /// The sync target finalized hash
+        sync_target_finalized: Option<B256>,
+    },
 }
 
 /// The engine API tree handler implementation.
@@ -512,7 +442,7 @@ pub struct EngineApiTreeHandler<P, E, T: EngineTypes> {
 
 impl<P, E, T> EngineApiTreeHandler<P, E, T>
 where
-    P: BlockReader + StateProviderFactory + Clone + 'static,
+    P: BlockReader + StateProviderFactory + StateReader + Clone + 'static,
     E: BlockExecutorProvider,
     T: EngineTypes,
 {
@@ -574,6 +504,7 @@ where
             last_persisted_block_hash: header.hash(),
             last_persisted_block_number: best_block_number,
             rx: None,
+            remove_above_state: VecDeque::new(),
         };
 
         let (tx, outgoing) = tokio::sync::mpsc::unbounded_channel();
@@ -787,12 +718,138 @@ where
 
         let mut outcome = TreeOutcome::new(status);
         if outcome.outcome.is_valid() && self.is_sync_target_head(block_hash) {
+            // NOTE: if we are in this branch, `is_sync_target_head` has returned true,
+            // meaning a sync target state exists, so we can safely unwrap
+            let sync_target = self.state.forkchoice_state_tracker.sync_target_state().unwrap();
+
+            // if the hash is zero then we should act like there is no finalized hash
+            let sync_target_finalized = if sync_target.finalized_block_hash == B256::ZERO {
+                None
+            } else {
+                Some(sync_target.finalized_block_hash)
+            };
+
             // if the block is valid and it is the sync target head, make it canonical
-            outcome =
-                outcome.with_event(TreeEvent::TreeAction(TreeAction::MakeCanonical(block_hash)));
+            outcome = outcome.with_event(TreeEvent::TreeAction(TreeAction::MakeCanonical {
+                sync_target_head: block_hash,
+                sync_target_finalized,
+            }));
         }
 
         Ok(outcome)
+    }
+
+    /// Returns the new chain for the given head.
+    ///
+    /// This also handles reorgs.
+    ///
+    /// Note: This does not update the tracked state and instead returns the new chain based on the
+    /// given head.
+    fn on_new_head(
+        &self,
+        new_head: B256,
+        finalized_block: Option<B256>,
+    ) -> ProviderResult<Option<NewCanonicalChain>> {
+        // get the finalized block
+        let Some(new_head_block) = self.state.tree_state.blocks_by_hash.get(&new_head) else {
+            return Ok(None)
+        };
+
+        let new_head_number = new_head_block.block.number;
+        let current_canonical_number = self.state.tree_state.current_canonical_head.number;
+
+        let mut new_chain = vec![new_head_block.clone()];
+        let mut current_hash = new_head_block.block.parent_hash;
+        let mut current_number = new_head_number - 1;
+
+        // Walk back the new chain until we reach a block we know about
+        //
+        // This is only done for in-memory blocks, because we should not have persisted any blocks
+        // that are _above_ the current canonical head.
+        while current_number > current_canonical_number {
+            if let Some(block) = self.state.tree_state.blocks_by_hash.get(&current_hash) {
+                new_chain.push(block.clone());
+                current_hash = block.block.parent_hash;
+                current_number -= 1;
+            } else {
+                return Ok(None); // We don't have the full chain
+            }
+        }
+
+        // If we have reached the current canonical head by walking back from the target, then we
+        // know this represents an extension of the canonical chain.
+        if current_hash == self.state.tree_state.current_canonical_head.hash {
+            new_chain.reverse();
+
+            // Simple extension of the current chain
+            return Ok(Some(NewCanonicalChain::Commit { new: new_chain }));
+        }
+
+        // We have a reorg. Walk back both chains to find the fork point.
+        let mut old_chain = Vec::new();
+        let mut old_hash = self.state.tree_state.current_canonical_head.hash;
+
+        while old_hash != current_hash {
+            if let Some(block) = self.executed_block_by_hash(old_hash)? {
+                old_chain.push(block.clone());
+                old_hash = block.block.header.parent_hash;
+            } else {
+                // This shouldn't happen as we're walking back the canonical chain
+                warn!(target: "consensus::engine", invalid_hash=?old_hash, "Canonical block not found in TreeState");
+                return Ok(None);
+            }
+
+            if old_hash == current_hash {
+                // We've found the fork point
+                break;
+            }
+
+            if let Some(block) = self.executed_block_by_hash(current_hash)? {
+                if self.is_fork(block.block.hash(), finalized_block)? {
+                    new_chain.push(block.clone());
+                    current_hash = block.block.parent_hash;
+                }
+            } else {
+                // This shouldn't happen as we've already walked this path
+                warn!(target: "consensus::engine", invalid_hash=?current_hash, "New chain block not found in TreeState");
+                return Ok(None);
+            }
+        }
+        new_chain.reverse();
+        old_chain.reverse();
+
+        Ok(Some(NewCanonicalChain::Reorg { new: new_chain, old: old_chain }))
+    }
+
+    /// Determines if the given block is part of a fork by checking that these
+    /// conditions are true:
+    /// * walking back from the target hash to verify that the target hash is not part of an
+    ///   extension of the canonical chain.
+    /// * walking back from the current head to verify that the target hash is not already part of
+    ///   the canonical chain.
+    fn is_fork(&self, target_hash: B256, finalized_hash: Option<B256>) -> ProviderResult<bool> {
+        // verify that the given hash is not part of an extension of the canon chain.
+        let mut current_hash = target_hash;
+        while let Some(current_block) = self.sealed_header_by_hash(current_hash)? {
+            if current_block.hash() == self.state.tree_state.canonical_block_hash() {
+                return Ok(false)
+            }
+            current_hash = current_block.parent_hash;
+        }
+
+        // verify that the given hash is not already part of the canon chain
+        current_hash = self.state.tree_state.canonical_block_hash();
+        while let Some(current_block) = self.sealed_header_by_hash(current_hash)? {
+            if Some(current_hash) == finalized_hash {
+                return Ok(true)
+            }
+
+            if current_block.hash() == target_hash {
+                return Ok(false)
+            }
+            current_hash = current_block.parent_hash;
+        }
+        Ok(true)
     }
 
     /// Invoked when we receive a new forkchoice update message. Calls into the blockchain tree
@@ -865,8 +922,14 @@ where
             return Ok(valid_outcome(state.head_block_hash))
         }
 
+        let finalized_block_opt = if state.finalized_block_hash == B256::ZERO {
+            None
+        } else {
+            Some(state.finalized_block_hash)
+        };
+
         // 2. ensure we can apply a new chain update for the head block
-        if let Some(chain_update) = self.state.tree_state.on_new_head(state.head_block_hash) {
+        if let Some(chain_update) = self.on_new_head(state.head_block_hash, finalized_block_opt)? {
             let tip = chain_update.tip().header.clone();
             self.on_canonical_chain_update(chain_update);
 
@@ -959,14 +1022,24 @@ where
     /// If we're currently awaiting a response this will try to receive the response (non-blocking)
     /// or send a new persistence action if necessary.
     fn advance_persistence(&mut self) -> Result<(), TryRecvError> {
-        if self.should_persist() && !self.persistence_state.in_progress() {
-            let blocks_to_persist = self.get_canonical_blocks_to_persist();
-            if blocks_to_persist.is_empty() {
-                debug!(target: "engine", "Returned empty set of blocks to persist");
-            } else {
-                let (tx, rx) = oneshot::channel();
-                let _ = self.persistence.save_blocks(blocks_to_persist, tx);
-                self.persistence_state.start(rx);
+        if !self.persistence_state.in_progress() {
+            if let Some(new_tip_num) = self.persistence_state.remove_above_state.pop_front() {
+                debug!(target: "engine", ?new_tip_num, remove_state=?self.persistence_state.remove_above_state, last_persisted_block_number=?self.persistence_state.last_persisted_block_number, "Removing blocks using persistence task");
+                if new_tip_num < self.persistence_state.last_persisted_block_number {
+                    debug!(target: "engine", ?new_tip_num, "Starting remove blocks job");
+                    let (tx, rx) = oneshot::channel();
+                    let _ = self.persistence.remove_blocks_above(new_tip_num, tx);
+                    self.persistence_state.start(rx);
+                }
+            } else if self.should_persist() {
+                let blocks_to_persist = self.get_canonical_blocks_to_persist();
+                if blocks_to_persist.is_empty() {
+                    debug!(target: "engine", "Returned empty set of blocks to persist");
+                } else {
+                    let (tx, rx) = oneshot::channel();
+                    let _ = self.persistence.save_blocks(blocks_to_persist, tx);
+                    self.persistence_state.start(rx);
+                }
             }
         }
 
@@ -978,22 +1051,21 @@ where
                 .expect("if a persistence task is in progress Receiver must be Some");
             // Check if persistence has complete
             match rx.try_recv() {
-                Ok(last_persisted_block_hash) => {
+                Ok(last_persisted_hash_num) => {
                     self.metrics.persistence_duration.record(start_time.elapsed());
-                    let Some(last_persisted_block_hash) = last_persisted_block_hash else {
+                    let Some((last_persisted_block_hash, last_persisted_block_number)) =
+                        last_persisted_hash_num
+                    else {
                         // if this happened, then we persisted no blocks because we sent an
                         // empty vec of blocks
                         warn!(target: "engine", "Persistence task completed but did not persist any blocks");
                         return Ok(())
                     };
-                    if let Some(block) =
-                        self.state.tree_state.block_by_hash(last_persisted_block_hash)
-                    {
-                        self.persistence_state.finish(last_persisted_block_hash, block.number);
-                        self.on_new_persisted_block();
-                    } else {
-                        error!("could not find persisted block with hash {last_persisted_block_hash} in memory");
-                    }
+
+                    debug!(target: "engine", ?last_persisted_block_hash, ?last_persisted_block_number, "Finished persisting, calling finish");
+                    self.persistence_state
+                        .finish(last_persisted_block_hash, last_persisted_block_number);
+                    self.on_new_persisted_block();
                 }
                 Err(TryRecvError::Closed) => return Err(TryRecvError::Closed),
                 Err(TryRecvError::Empty) => self.persistence_state.rx = Some((rx, start_time)),
@@ -1173,8 +1245,10 @@ where
     /// Attempts to make the given target canonical.
     ///
     /// This will update the tracked canonical in memory state and do the necessary housekeeping.
-    fn make_canonical(&mut self, target: B256) {
-        if let Some(chain_update) = self.state.tree_state.on_new_head(target) {
+    fn make_canonical(&mut self, target: B256, finalized: Option<B256>) {
+        // TODO: propagate errors, after https://github.com/paradigmxyz/reth/pull/10276 is merged,
+        // since it makes it easier
+        if let Ok(Some(chain_update)) = self.on_new_head(target, finalized) {
             self.on_canonical_chain_update(chain_update);
         }
     }
@@ -1190,8 +1264,8 @@ where
     fn on_tree_event(&mut self, event: TreeEvent) {
         match event {
             TreeEvent::TreeAction(action) => match action {
-                TreeAction::MakeCanonical(target) => {
-                    self.make_canonical(target);
+                TreeAction::MakeCanonical { sync_target_head, sync_target_finalized } => {
+                    self.make_canonical(sync_target_head, sync_target_finalized);
                 }
             },
             TreeEvent::BackfillAction(action) => {
@@ -1287,10 +1361,58 @@ where
     /// Assumes that `finish` has been called on the `persistence_state` at least once
     fn on_new_persisted_block(&mut self) {
         let finalized = self.state.forkchoice_state_tracker.last_valid_finalized();
-        self.remove_before(self.persistence_state.last_persisted_block_number, finalized)
-            .expect("todo: error handling");
-        self.canonical_in_memory_state
-            .remove_persisted_blocks(self.persistence_state.last_persisted_block_number);
+        debug!(target: "engine", last_persisted_hash=?self.persistence_state.last_persisted_block_hash, last_persisted_number=?self.persistence_state.last_persisted_block_number, ?finalized, "New persisted block, clearing in memory blocks");
+        self.remove_before(
+            self.persistence_state.last_persisted_block_number.saturating_sub(1),
+            finalized,
+        )
+        .expect("todo: error handling");
+        self.canonical_in_memory_state.remove_persisted_blocks(
+            self.persistence_state.last_persisted_block_number.saturating_sub(1),
+        );
+    }
+
+    /// Return an [`ExecutedBlock`] from database or in-memory state by hash.
+    ///
+    /// NOTE: This cannot fetch [`ExecutedBlock`]s for _finalized_ blocks, instead it can only
+    /// fetch [`ExecutedBlock`]s for _canonical_ blocks, or blocks from sidechains that the node
+    /// has in memory.
+    ///
+    /// For finalized blocks, this will return `None`.
+    #[allow(unused)]
+    fn executed_block_by_hash(&self, hash: B256) -> ProviderResult<Option<ExecutedBlock>> {
+        debug!(target: "engine", ?hash, "Fetching executed block by hash");
+        // check memory first
+        let block = self
+            .state
+            .tree_state
+            .executed_block_by_hash(hash)
+            // TODO: clone for compatibility. should we return an Arc here?
+            .cloned();
+
+        if block.is_some() {
+            Ok(block)
+        } else if let Some((_, updates)) = self.state.tree_state.persisted_trie_updates.get(&hash) {
+            debug!(target: "engine", empty_updates=?updates.is_empty(), "Found trie updates for block");
+            let SealedBlockWithSenders { block, senders } = self
+                .provider
+                .sealed_block_with_senders(hash.into(), TransactionVariant::WithHash)?
+                .expect("todo: some sort of error or return None if num not found");
+            let execution_output = self.provider.get_state(block.number)?.expect("again todo err");
+            let hashed_state = execution_output.hash_state_slow();
+
+            // todo: construct hashed state
+            Ok(Some(ExecutedBlock {
+                block: Arc::new(block),
+                senders: Arc::new(senders),
+                // TODO: should we `remove` to take ownership and remove the clone?
+                trie: updates.clone(),
+                execution_output: Arc::new(execution_output),
+                hashed_state: Arc::new(hashed_state),
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Return sealed block from database or in-memory state by hash.
@@ -1518,7 +1640,21 @@ where
                     if self.is_sync_target_head(child_num_hash.hash) &&
                         matches!(res, InsertPayloadOk2::Inserted(BlockStatus2::Valid))
                     {
-                        self.make_canonical(child_num_hash.hash);
+                        // NOTE: if we are in this branch, `is_sync_target_head` has returned true,
+                        // meaning a sync target state exists, so we can safely unwrap
+                        // TODO: is the sync target the right thing to check for here?
+                        let sync_target =
+                            self.state.forkchoice_state_tracker.sync_target_state().unwrap();
+
+                        // if the hash is zero then we should act like there is no finalized hash
+                        let sync_target_finalized =
+                            if sync_target.finalized_block_hash == B256::ZERO {
+                                None
+                            } else {
+                                Some(sync_target.finalized_block_hash)
+                            };
+
+                        self.make_canonical(child_num_hash.hash, sync_target_finalized);
                     }
                 }
                 Err(err) => {
@@ -1657,18 +1793,70 @@ where
         None
     }
 
+    /// This determines whether or not we should remove blocks from the chain, based on a canonical
+    /// chain update.
+    ///
+    /// If the chain update is a reorg:
+    /// * is the new chain behind the last persisted block, or
+    /// * if the root of the new chain is at the same height as the last persisted block, is it a
+    ///   different block
+    ///
+    /// If either of these are true, then this returns the height of the first block. Otherwise,
+    /// this returns [`None`]. This should be used to check whether or not we should be sending a
+    /// remove command to the persistence task.
+    fn is_disk_reorg(&self, chain_update: &NewCanonicalChain) -> Option<u64> {
+        let NewCanonicalChain::Reorg { new, old: _ } = chain_update else { return None };
+
+        let BlockNumHash { number: new_num, hash: new_hash } =
+            new.first().map(|block| block.block.num_hash())?;
+
+        match new_num.cmp(&self.persistence_state.last_persisted_block_number) {
+            Ordering::Greater => {
+                // new number is above the last persisted block so the reorg can be performed
+                // entirely in memory
+                None
+            }
+            Ordering::Equal => {
+                // new number is the same, if the hash is the same then we should not need to remove
+                // any blocks
+                (self.persistence_state.last_persisted_block_hash != new_hash).then_some(new_num)
+            }
+            Ordering::Less => {
+                // this means we are below the last persisted block and must remove on disk blocks
+                Some(new_num)
+            }
+        }
+    }
+
     /// Invoked when we the canonical chain has been updated.
     ///
     /// This is invoked on a valid forkchoice update, or if we can make the target block canonical.
     fn on_canonical_chain_update(&mut self, chain_update: NewCanonicalChain) {
-        trace!(target: "engine", new_blocks = %chain_update.new_block_count(), reorged_blocks =  %chain_update.reorged_block_count() ,"applying new chain update");
+        trace!(target: "engine", new_blocks = %chain_update.new_block_count(), reorged_blocks =  %chain_update.reorged_block_count(), "applying new chain update");
         let start = Instant::now();
+
+        // schedule a remove_above call if we have an on-disk reorg
+        if let Some(height) = self.is_disk_reorg(&chain_update) {
+            // calculate the new tip by subtracting one from the lowest part of the chain
+            let new_tip_num = height.saturating_sub(1);
+            self.persistence_state.schedule_removal(new_tip_num);
+        }
 
         // update the tracked canonical head
         self.state.tree_state.set_canonical_head(chain_update.tip().num_hash());
 
         let tip = chain_update.tip().header.clone();
         let notification = chain_update.to_chain_notification();
+
+        // reinsert any missing reorged blocks
+        if let NewCanonicalChain::Reorg { new, old } = &chain_update {
+            let new_first = new.first().map(|first| first.block.num_hash());
+            let old_first = old.first().map(|first| first.block.num_hash());
+            debug!(target: "engine", ?new_first, ?old_first, "Reorg detected, new and old first blocks");
+
+            self.reinsert_reorged_blocks(new.clone());
+            self.reinsert_reorged_blocks(old.clone());
+        }
 
         // update the tracked in-memory state with the new chain
         self.canonical_in_memory_state.update_chain(chain_update);
@@ -1682,6 +1870,19 @@ where
             Box::new(tip),
             start.elapsed(),
         ));
+    }
+
+    /// This reinserts any blocks in the new chain that do not already exist in the tree
+    fn reinsert_reorged_blocks(&mut self, new_chain: Vec<ExecutedBlock>) {
+        debug!(target: "engine", first=?new_chain.first().map(|b| b.block.num_hash()), last=?new_chain.last().map(|b| b.block.num_hash()), "Trying to reinsert reorged blocks into tree state");
+        for block in new_chain {
+            debug!(target: "engine", num=?block.block.number, hash=?block.block.hash(), "Trying to reinsert block into tree state");
+            if self.state.tree_state.executed_block_by_hash(block.block.hash()).is_none() {
+                debug!(target: "engine", num=?block.block.number, hash=?block.block.hash(), "Reinserting block into tree state");
+                self.state.tree_state.insert_executed(block);
+                // TODO: check that parent_to_child is still well formed after this
+            }
+        }
     }
 
     /// This handles downloaded blocks that are shown to be disconnected from the canonical chain.
@@ -1754,11 +1955,24 @@ where
             Ok(InsertPayloadOk2::Inserted(BlockStatus2::Valid)) => {
                 if self.is_sync_target_head(block_num_hash.hash) {
                     trace!(target: "engine", "appended downloaded sync target block");
+                    // NOTE: if we are in this branch, `is_sync_target_head` has returned true,
+                    // meaning a sync target state exists, so we can safely unwrap
+                    let sync_target =
+                        self.state.forkchoice_state_tracker.sync_target_state().unwrap();
+
+                    // if the hash is zero then we should act like there is no finalized hash
+                    let sync_target_finalized = if sync_target.finalized_block_hash == B256::ZERO {
+                        None
+                    } else {
+                        Some(sync_target.finalized_block_hash)
+                    };
+
                     // we just inserted the current sync target block, we can try to make it
                     // canonical
-                    return Ok(Some(TreeEvent::TreeAction(TreeAction::MakeCanonical(
-                        block_num_hash.hash,
-                    ))))
+                    return Ok(Some(TreeEvent::TreeAction(TreeAction::MakeCanonical {
+                        sync_target_head: block_num_hash.hash,
+                        sync_target_finalized,
+                    })))
                 }
                 trace!(target: "engine", "appended downloaded block");
                 self.try_connect_buffered_blocks(block_num_hash)?;
@@ -1896,8 +2110,18 @@ where
         self.state.tree_state.insert_executed(executed);
         self.metrics.executed_blocks.set(self.state.tree_state.block_count() as f64);
 
+        // TODO: is the sync target state the right thing to check for here?
+        let finalized = self.state.forkchoice_state_tracker.sync_target_state().and_then(|state| {
+            // if the hash is zero then we should act like there is no finalized hash
+            if state.finalized_block_hash == B256::ZERO {
+                None
+            } else {
+                Some(state.finalized_block_hash)
+            }
+        });
+
         // emit insert event
-        let engine_event = if self.state.tree_state.is_fork(block_hash) {
+        let engine_event = if self.is_fork(block_hash, finalized)? {
             BeaconConsensusEngineEvent::ForkBlockAdded(sealed_block)
         } else {
             BeaconConsensusEngineEvent::CanonicalBlockAdded(sealed_block, start.elapsed())
@@ -2139,11 +2363,15 @@ pub struct PersistenceState {
     last_persisted_block_hash: B256,
     /// Receiver end of channel where the result of the persistence task will be
     /// sent when done. A None value means there's no persistence task in progress.
-    rx: Option<(oneshot::Receiver<Option<B256>>, Instant)>,
+    #[allow(clippy::type_complexity)]
+    rx: Option<(oneshot::Receiver<Option<(B256, BlockNumber)>>, Instant)>,
     /// The last persisted block number.
     ///
     /// This tracks the chain height that is persisted on disk
     last_persisted_block_number: u64,
+    /// The block above which blocks should be removed from disk, because there has been an on disk
+    /// reorg.
+    remove_above_state: VecDeque<u64>,
 }
 
 impl PersistenceState {
@@ -2154,8 +2382,15 @@ impl PersistenceState {
     }
 
     /// Sets state for a started persistence task.
-    fn start(&mut self, rx: oneshot::Receiver<Option<B256>>) {
+    fn start(&mut self, rx: oneshot::Receiver<Option<(B256, BlockNumber)>>) {
         self.rx = Some((rx, Instant::now()));
+    }
+
+    /// Sets the `remove_above_state`, to the new tip number specified, only if it is less than the
+    /// current `last_persisted_block_number`.
+    fn schedule_removal(&mut self, new_tip_num: u64) {
+        debug!(target: "engine", ?new_tip_num, prev_remove_state=?self.remove_above_state, last_persisted_block_number=?self.last_persisted_block_number, "Scheduling removal");
+        self.remove_above_state.push_back(new_tip_num);
     }
 
     /// Sets state for a finished persistence task.
@@ -2271,6 +2506,7 @@ mod tests {
                 blocks_by_number,
                 current_canonical_head: blocks.last().unwrap().block().num_hash(),
                 parent_to_child,
+                persisted_trie_updates: HashMap::default(),
             };
 
             let last_executed_block = blocks.last().unwrap().clone();
@@ -2897,17 +3133,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_tree_state_on_new_head() {
-        let mut tree_state = TreeState::new(BlockNumHash::default());
+        let chain_spec = MAINNET.clone();
+        let mut test_harness = TestHarness::new(chain_spec);
+        // let mut tree_state = TreeState::new(BlockNumHash::default());
         let mut test_block_builder = TestBlockBuilder::default();
 
         let blocks: Vec<_> = test_block_builder.get_executed_blocks(1..6).collect();
 
         for block in &blocks {
-            tree_state.insert_executed(block.clone());
+            test_harness.tree.state.tree_state.insert_executed(block.clone());
         }
 
         // set block 3 as the current canonical head
-        tree_state.set_canonical_head(blocks[2].block.num_hash());
+        test_harness.tree.state.tree_state.set_canonical_head(blocks[2].block.num_hash());
 
         // create a fork from block 2
         let fork_block_3 =
@@ -2917,12 +3155,12 @@ mod tests {
         let fork_block_5 =
             test_block_builder.get_executed_block_with_number(5, fork_block_4.block.hash());
 
-        tree_state.insert_executed(fork_block_3.clone());
-        tree_state.insert_executed(fork_block_4.clone());
-        tree_state.insert_executed(fork_block_5.clone());
+        test_harness.tree.state.tree_state.insert_executed(fork_block_3.clone());
+        test_harness.tree.state.tree_state.insert_executed(fork_block_4.clone());
+        test_harness.tree.state.tree_state.insert_executed(fork_block_5.clone());
 
         // normal (non-reorg) case
-        let result = tree_state.on_new_head(blocks[4].block.hash());
+        let result = test_harness.tree.on_new_head(blocks[4].block.hash(), None).unwrap();
         assert!(matches!(result, Some(NewCanonicalChain::Commit { .. })));
         if let Some(NewCanonicalChain::Commit { new }) = result {
             assert_eq!(new.len(), 2);
@@ -2931,7 +3169,7 @@ mod tests {
         }
 
         // reorg case
-        let result = tree_state.on_new_head(fork_block_5.block.hash());
+        let result = test_harness.tree.on_new_head(fork_block_5.block.hash(), None).unwrap();
         assert!(matches!(result, Some(NewCanonicalChain::Reorg { .. })));
         if let Some(NewCanonicalChain::Reorg { new, old }) = result {
             assert_eq!(new.len(), 3);
@@ -2948,26 +3186,28 @@ mod tests {
     async fn test_tree_state_on_new_head_deep_fork() {
         reth_tracing::init_test_tracing();
 
-        let mut tree_state = TreeState::new(BlockNumHash::default());
+        let chain_spec = MAINNET.clone();
+        let mut test_harness = TestHarness::new(chain_spec);
+        // let mut tree_state = TreeState::new(BlockNumHash::default());
         let mut test_block_builder = TestBlockBuilder::default();
 
         let blocks: Vec<_> = test_block_builder.get_executed_blocks(0..5).collect();
 
         for block in &blocks {
-            tree_state.insert_executed(block.clone());
+            test_harness.tree.state.tree_state.insert_executed(block.clone());
         }
 
         // set last block as the current canonical head
         let last_block = blocks.last().unwrap().block.clone();
 
-        tree_state.set_canonical_head(last_block.num_hash());
+        test_harness.tree.state.tree_state.set_canonical_head(last_block.num_hash());
 
         // create a fork chain from last_block
         let chain_a = test_block_builder.create_fork(&last_block, 10);
         let chain_b = test_block_builder.create_fork(&last_block, 10);
 
         for block in &chain_a {
-            tree_state.insert_executed(ExecutedBlock {
+            test_harness.tree.state.tree_state.insert_executed(ExecutedBlock {
                 block: Arc::new(block.block.clone()),
                 senders: Arc::new(block.senders.clone()),
                 execution_output: Arc::new(ExecutionOutcome::default()),
@@ -2975,10 +3215,10 @@ mod tests {
                 trie: Arc::new(TrieUpdates::default()),
             });
         }
-        tree_state.set_canonical_head(chain_a.last().unwrap().num_hash());
+        test_harness.tree.state.tree_state.set_canonical_head(chain_a.last().unwrap().num_hash());
 
         for block in &chain_b {
-            tree_state.insert_executed(ExecutedBlock {
+            test_harness.tree.state.tree_state.insert_executed(ExecutedBlock {
                 block: Arc::new(block.block.clone()),
                 senders: Arc::new(block.senders.clone()),
                 execution_output: Arc::new(ExecutionOutcome::default()),
@@ -2988,7 +3228,8 @@ mod tests {
         }
 
         // reorg case
-        let result = tree_state.on_new_head(chain_b.first().unwrap().block.hash());
+        let result =
+            test_harness.tree.on_new_head(chain_b.first().unwrap().block.hash(), None).unwrap();
         assert!(matches!(result, Some(NewCanonicalChain::Reorg { .. })));
         if let Some(NewCanonicalChain::Reorg { new, old }) = result {
             assert_eq!(new.len(), 1);
@@ -3411,7 +3652,7 @@ mod tests {
         test_harness.check_canon_head(chain_b_tip_hash);
 
         // verify that chain A is now considered a fork
-        assert!(test_harness.tree.state.tree_state.is_fork(chain_a.last().unwrap().hash()));
+        assert!(test_harness.tree.is_fork(chain_a.last().unwrap().hash(), None).unwrap());
     }
 
     #[tokio::test]

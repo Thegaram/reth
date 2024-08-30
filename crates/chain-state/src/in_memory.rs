@@ -20,6 +20,7 @@ use std::{
     time::Instant,
 };
 use tokio::sync::{broadcast, watch};
+use tracing::debug;
 
 /// Size of the broadcast channel used to notify canonical state events.
 const CANON_STATE_NOTIFICATION_CHANNEL_SIZE: usize = 256;
@@ -245,6 +246,7 @@ impl CanonicalInMemoryState {
 
             // we first remove the blocks from the reorged chain
             for block in reorged {
+                debug!(target: "engine", num=?block.block.number, hash=?block.block.hash(), "removing block from in_memory_state");
                 let hash = block.block().hash();
                 let number = block.block().number;
                 blocks.remove(&hash);
@@ -253,6 +255,7 @@ impl CanonicalInMemoryState {
 
             // insert the new blocks
             for block in new_blocks {
+                debug!(target: "engine", num=?block.block.number, hash=?block.block.hash(), "reinserting block into in_memory_state");
                 let parent = blocks.get(&block.block().parent_hash).cloned();
                 let block_state =
                     BlockState::with_parent(block.clone(), parent.map(|p| (*p).clone()));
